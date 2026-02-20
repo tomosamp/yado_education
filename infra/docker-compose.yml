@@ -1,0 +1,148 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: yado-mysql
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE}
+      MYSQL_USER: ${DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      TZ: Asia/Tokyo
+    ports:
+      - "${MYSQL_HOST_PORT}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: yado-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      TZ: Asia/Tokyo
+    ports:
+      - "${MINIO_API_HOST_PORT}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT}:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "/scripts/init-minio.sh"]
+    volumes:
+      - ./scripts/init-minio.sh:/scripts/init-minio.sh:ro
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: yado-mailpit
+    ports:
+      - "${MAILPIT_SMTP_HOST_PORT}:1025"
+      - "${MAILPIT_UI_HOST_PORT}:8025"
+
+  judge-runner-builder:
+    build:
+      context: .
+      dockerfile: ./judge-runner/Dockerfile
+    image: yado-judge-runner:latest
+    command: ["sh", "-c", "echo judge-runner image built"]
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: ../infra/backend/Dockerfile
+    container_name: yado-backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      mailpit:
+        condition: service_started
+      judge-runner-builder:
+        condition: service_completed_successfully
+    env_file:
+      - ../backend/.env
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_URL: ${APP_URL}
+      FRONTEND_URL: ${FRONTEND_URL}
+      SANCTUM_STATEFUL_DOMAINS: ${SANCTUM_STATEFUL_DOMAINS}
+      AWS_URL: ${AWS_URL}
+      JUDGE_IMAGE: yado-judge-runner:latest
+    volumes:
+      - ../backend:/var/www/html
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${BACKEND_HOST_PORT}:8000"
+    command:
+      [
+        "sh",
+        "-lc",
+        "composer install && if ! grep -q '^APP_KEY=base64:' .env; then php artisan key:generate; fi && php artisan migrate --force && php artisan serve --host=0.0.0.0 --port=8000",
+      ]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "php -r \"exit((int)!(@file_get_contents('http://127.0.0.1:8000/up') !== false));\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  queue-worker:
+    build:
+      context: ../backend
+      dockerfile: ../infra/backend/Dockerfile
+    container_name: yado-queue
+    depends_on:
+      backend:
+        condition: service_healthy
+    env_file:
+      - ../backend/.env
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_URL: ${APP_URL}
+      FRONTEND_URL: ${FRONTEND_URL}
+      SANCTUM_STATEFUL_DOMAINS: ${SANCTUM_STATEFUL_DOMAINS}
+      AWS_URL: ${AWS_URL}
+      JUDGE_IMAGE: yado-judge-runner:latest
+    volumes:
+      - ../backend:/var/www/html
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      [
+        "sh",
+        "-lc",
+        "composer install && php artisan queue:work --queue=judge,default --tries=1 --timeout=30",
+      ]
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../infra/frontend.Dockerfile
+    container_name: yado-frontend
+    env_file:
+      - ../frontend/.env
+    volumes:
+      - ../frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "${FRONTEND_HOST_PORT}:5173"
+    command: ["sh", "-lc", "npm install && npm run dev -- --host 0.0.0.0 --port 5173"]
+
+volumes:
+  mysql_data:
+  minio_data:
+  frontend_node_modules:
